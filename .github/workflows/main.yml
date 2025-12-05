@@ -1,0 +1,126 @@
+name: Monitor Release Downloads
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  check-downloads:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get current download counts
+        id: current
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ vars.MONITOR_TAG }}")
+          
+          # Extract asset names and download counts
+          echo "$RESPONSE" | jq -r '.assets[] | "\(.name):\(.download_count)"' > current_counts.txt
+          
+          # Create summary for email
+          SUMMARY=$(echo "$RESPONSE" | jq -r '.assets[] | "  \(.name): \(.download_count) downloads"')
+          echo "SUMMARY<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          cat current_counts.txt
+
+      - name: Download previous counts
+        id: previous
+        continue-on-error: true
+        run: |
+          # Try to get previous counts from artifacts
+          gh run list --workflow=download-monitor.yml --status=success --limit=1 --json databaseId -q '.[0].databaseId' > last_run_id.txt
+          
+          if [ -s last_run_id.txt ]; then
+            LAST_RUN_ID=$(cat last_run_id.txt)
+            gh run download $LAST_RUN_ID -n download-counts 2>/dev/null || echo "No previous counts found"
+          fi
+          
+          if [ -f previous_counts.txt ]; then
+            echo "Previous counts found"
+            cat previous_counts.txt
+            echo "HAS_PREVIOUS=true" >> $GITHUB_OUTPUT
+          else
+            echo "No previous counts found"
+            echo "HAS_PREVIOUS=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare counts and detect changes
+        id: compare
+        run: |
+          if [ ! -f previous_counts.txt ]; then
+            echo "First run - no comparison possible"
+            echo "CHANGED=false" >> $GITHUB_OUTPUT
+            echo "CHANGES=First monitoring run - baseline established" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          CHANGED=false
+          CHANGES=""
+          
+          while IFS=: read -r name current_count; do
+            previous_count=$(grep "^${name}:" previous_counts.txt 2>/dev/null | cut -d: -f2)
+            
+            if [ -z "$previous_count" ]; then
+              CHANGED=true
+              CHANGES="${CHANGES}\n  NEW: ${name} - ${current_count} downloads"
+            elif [ "$current_count" -gt "$previous_count" ]; then
+              CHANGED=true
+              increase=$((current_count - previous_count))
+              CHANGES="${CHANGES}\n  ${name}: ${previous_count} → ${current_count} (+${increase})"
+            fi
+          done < current_counts.txt
+          
+          if [ "$CHANGED" = true ]; then
+            echo "CHANGED=true" >> $GITHUB_OUTPUT
+            echo "CHANGES<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$CHANGES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "Download counts have increased!"
+          else
+            echo "CHANGED=false" >> $GITHUB_OUTPUT
+            echo "No changes in download counts"
+          fi
+
+      - name: Send email notification
+        if: steps.compare.outputs.CHANGED == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "📈 Release Downloads Increased - ${{ vars.MONITOR_TAG }}"
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.GMAIL_USERNAME }}
+          body: |
+            Release downloads have increased for tag: ${{ vars.MONITOR_TAG }}
+            Repository: ${{ github.repository }}
+            
+            Changes Detected:
+            ${{ steps.compare.outputs.CHANGES }}
+            
+            Current Download Counts:
+            ${{ steps.current.outputs.SUMMARY }}
+            
+            ---
+            Monitored at: ${{ github.event.repository.updated_at }}
+            Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Save current counts as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-counts
+          path: current_counts.txt
+          retention-days: 90
